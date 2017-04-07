@@ -1,15 +1,16 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Lib where
-import           Control.Concurrent       (forkFinally, forkIO,
-                                           threadDelay)
+import           Control.Concurrent       (forkFinally, forkIO, threadDelay)
 import           Control.Concurrent.Chan
 import qualified Control.Exception        as X
 import           Control.Monad            (forever)
 import           Data.List                (isPrefixOf)
 import           Data.Monoid              ((<>))
-import           Network                  (PortID(..), listenOn, accept)
+import           Network                  (PortID (..), accept, listenOn)
 import           Network.Socket           hiding (accept)
-import           System.IO
+import           System.IO                (BufferMode (LineBuffering), Handle,
+                                           hClose, hGetLine, hPutStrLn,
+                                           hSetBinaryMode, hSetBuffering)
 import           System.IO.Error          (isEOFError)
 import           System.Process
 import           System.Process.Internals
@@ -25,20 +26,31 @@ getPid ph = withProcessHandle ph unpack
 
 
 mkProcess :: IO (Handle, Handle, Handle, ProcessHandle)
-mkProcess = do
-  let p =
-        createProcess
-          (proc "ghc-mod" ["-b", "\n", "legacy-interactive"])
-          { std_in = CreatePipe
-          , std_out = CreatePipe
-          , std_err = CreatePipe
-          }
-  (Just hin,Just hout,Just herr,ph) <- p
-  hSetBuffering hin LineBuffering
-  hSetBuffering herr LineBuffering
-  hSetBuffering hout LineBuffering
-  hSetBinaryMode hout False
-  return (hin, hout, herr, ph)
+mkProcess =
+  X.bracketOnError
+    (createProcess
+       (proc "ghc-mod" ["-b", "\n", "legacy-interactive"])
+       { std_in = CreatePipe
+       , std_out = CreatePipe
+       , std_err = CreatePipe
+       })
+    shutDown
+    work
+  where
+    work (Just hin,Just hout,Just herr,ph) = do
+      hSetBuffering hin LineBuffering
+      hSetBuffering herr LineBuffering
+      hSetBuffering hout LineBuffering
+      hSetBinaryMode hout False
+      return (hin, hout, herr, ph)
+    shutDown (Just hin,Just hout,_,ph) =
+      getPid ph >>=
+      \pid -> do
+         putStrLn "what is the error"
+         print pid
+         terminateProcess ph >> waitForProcess ph
+         hClose hin
+         hClose hout
 
 
 sleep :: Int -> IO ()
@@ -55,22 +67,26 @@ readUntilOk handle acc = do
         else readUntilOk handle acc
     Right line ->
       if "OK" `isPrefixOf` line
-        then return acc
+        then return (line : acc)
         else readUntilOk handle (line : acc)
 
 
-go :: Chan String -> Chan String -> IO b
+go :: Chan String -> Chan String -> IO ()
 go inChan outChan = do
-  (hin,hout,herr,ph) <- mkProcess
-  let go' = do
-        msg <- readChan inChan
-        exitCodeM <- getProcessExitCode ph
-        case exitCodeM of
-          Just _ -> error "process died; should restart it here"
-          Nothing ->
-            hPutStrLn hin msg >> readUntilOk hout [] >>=
+  (hin,hout,_,ph) <- mkProcess
+  go' hin hout ph
+  where
+    go' hin' hout' ph' = do
+      msg <- readChan inChan
+      exitCodeM <- getProcessExitCode ph'
+      case exitCodeM of
+        Just _ -> do
+          hClose hin'
+          hClose hout'
+        Nothing -> do
+          hPutStrLn hin' msg >> readUntilOk hout' [] >>=
             \results -> writeChan outChan (unlines (reverse results))
-  forever go'
+          go' hin' hout' ph'
 
 
 main :: IO ()
@@ -78,7 +94,7 @@ main = withSocketsDo $ do
   sock <- listenOn (PortNumber(fromIntegral port))
   putStrLn $ "listening on port " <> show port
   forever $ do
-    (handle, host, port) <- accept sock
+    (handle, _, _) <- accept sock
     forkFinally (talk handle) (\_ -> hClose handle)
 
 
@@ -96,7 +112,7 @@ talk h = do
   where
     loop inChan' outChan' = do
       line <- hGetLine h
-      if "check" `isPrefixOf` line
+      if "check" `isPrefixOf` line || "lint" `isPrefixOf` line
         then do
           writeChan inChan' line
           res' <- readChan outChan'
