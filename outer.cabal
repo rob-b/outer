@@ -37,6 +37,9 @@ library
     , process
     , errors
     , network
+    , stm
+    , stm-chans
+    , transformers
 
 executable outer
   default-language: Haskell2010

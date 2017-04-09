@@ -1,17 +1,22 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Lib where
-import           Control.Concurrent       (forkFinally, forkIO, threadDelay)
-import           Control.Concurrent.Chan
-import qualified Control.Exception        as X
-import           Control.Monad            (forever)
-import           Data.List                (isPrefixOf)
-import           Data.Monoid              ((<>))
-import           Network                  (PortID (..), accept, listenOn)
-import           Network.Socket           hiding (accept)
-import           System.IO                (BufferMode (LineBuffering), Handle,
-                                           hClose, hGetLine, hPutStrLn,
-                                           hSetBinaryMode, hSetBuffering)
-import           System.IO.Error          (isEOFError)
+ 
+import           Control.Concurrent            (forkFinally, threadDelay)
+import           Control.Concurrent.STM        (atomically)
+import           Control.Concurrent.STM.TMChan
+import qualified Control.Exception             as X
+import           Control.Monad                 (forever, when)
+import           Control.Monad.Trans.Class     (lift)
+import           Control.Monad.Trans.Except    (runExceptT, throwE)
+import           Data.List                     (isPrefixOf)
+import           Data.Maybe                    (isNothing)
+import           Data.Monoid                   ((<>))
+import           Network.Socket
+import           System.IO                     (BufferMode (LineBuffering),
+                                                Handle, IOMode (ReadWriteMode),
+                                                hClose, hGetLine, hPutStrLn,
+                                                hSetBinaryMode, hSetBuffering)
+import           System.IO.Error               (isEOFError)
 import           System.Process
 import           System.Process.Internals
 
@@ -26,31 +31,20 @@ getPid ph = withProcessHandle ph unpack
 
 
 mkProcess :: IO (Handle, Handle, Handle, ProcessHandle)
-mkProcess =
-  X.bracketOnError
-    (createProcess
-       (proc "ghc-mod" ["-b", "\n", "legacy-interactive"])
-       { std_in = CreatePipe
-       , std_out = CreatePipe
-       , std_err = CreatePipe
-       })
-    shutDown
-    work
-  where
-    work (Just hin,Just hout,Just herr,ph) = do
-      hSetBuffering hin LineBuffering
-      hSetBuffering herr LineBuffering
-      hSetBuffering hout LineBuffering
-      hSetBinaryMode hout False
-      return (hin, hout, herr, ph)
-    shutDown (Just hin,Just hout,_,ph) =
-      getPid ph >>=
-      \pid -> do
-         putStrLn "what is the error"
-         print pid
-         terminateProcess ph >> waitForProcess ph
-         hClose hin
-         hClose hout
+mkProcess = do
+  let p =
+        createProcess
+          (proc "ghc-mod" ["-b", "\n", "legacy-interactive"])
+          { std_in = CreatePipe
+          , std_out = CreatePipe
+          , std_err = CreatePipe
+          }
+  (Just hin,Just hout,Just herr,ph) <- p
+  hSetBuffering hin LineBuffering
+  hSetBuffering herr LineBuffering
+  hSetBuffering hout LineBuffering
+  hSetBinaryMode hout False
+  return (hin, hout, herr, ph)
 
 
 sleep :: Int -> IO ()
@@ -71,51 +65,78 @@ readUntilOk handle acc = do
         else readUntilOk handle (line : acc)
 
 
-go :: Chan String -> Chan String -> IO ()
+go :: TMChan String -> TMChan String -> IO ()
 go inChan outChan = do
   (hin,hout,_,ph) <- mkProcess
+  putStrLn "Made new process"
   go' hin hout ph
   where
     go' hin' hout' ph' = do
-      msg <- readChan inChan
-      exitCodeM <- getProcessExitCode ph'
-      case exitCodeM of
-        Just _ -> do
-          hClose hin'
-          hClose hout'
-        Nothing -> do
-          hPutStrLn hin' msg >> readUntilOk hout' [] >>=
-            \results -> writeChan outChan (unlines (reverse results))
-          go' hin' hout' ph'
+      msgM <- atomically $ readTMChan inChan
+      case msgM of
+        Nothing -> error "Channel is closed. Do something!"
+        Just msg -> do
+          exitCodeM <- getProcessExitCode ph'
+          putStrLn $ maybe "ghc-mod is still running" (\ec -> "exit code: " <> show ec) exitCodeM
+          case exitCodeM of
+            Just _ -> do
+              hClose hin'
+              hClose hout'
+              return ()
+            Nothing -> do
+              hPutStrLn hin' msg >> readUntilOk hout' [] >>=
+                \results -> atomically $ writeTMChan outChan (unlines (reverse results))
+              go' hin' hout' ph'
+
+
+data GhcMod = GhcMod
+  { stdoutHandle :: Handle
+  , stdinHandle :: Handle
+  , processHandle :: ProcessHandle
+  }
 
 
 main :: IO ()
-main = withSocketsDo $ do
-  sock <- listenOn (PortNumber(fromIntegral port))
-  putStrLn $ "listening on port " <> show port
-  forever $ do
-    (handle, _, _) <- accept sock
-    forkFinally (talk handle) (\_ -> hClose handle)
+main =
+  withSocketsDo $
+  do sock <- socket AF_INET Stream 0
+     setSocketOption sock ReuseAddr 1
+     bind sock (SockAddrInet port iNADDR_ANY)
+     listen sock 2
+     putStrLn $ "listening on port " <> show port
+     forever $
+       do (conn,_) <- accept sock
+          handle <- socketToHandle conn ReadWriteMode
+          forkFinally
+            (talk handle)
+            (\eE ->
+                putStrLn (either show (const "no errors from talk") eE) >>
+                putStrLn "The talk process died" >>
+                hClose handle)
 
 
-port :: Int
+port :: PortNumber
 port = 4444
 
 
 talk :: Handle -> IO ()
 talk h = do
   hSetBuffering h LineBuffering
-  inChan <- newChan
-  outChan <- newChan
-  forkIO $ go inChan outChan
-  loop inChan outChan
+  inChan <- newTMChanIO
+  outChan <- newTMChanIO
+  forkFinally
+    (go inChan outChan)
+    (\_ -> atomically (closeTMChan inChan) >> atomically (closeTMChan outChan))
+  _ <- fmap (either id id) $ runExceptT $ forever $ loop inChan outChan
+  return ()
   where
-    loop inChan' outChan' = do
-      line <- hGetLine h
-      if "check" `isPrefixOf` line || "lint" `isPrefixOf` line
-        then do
-          writeChan inChan' line
-          res' <- readChan outChan'
-          putStrLn res'
-          loop inChan' outChan'
-        else putStrLn "2"
+    loop inChan' outChan' =
+      do
+        line <- lift $ hGetLine h
+        if "check" `isPrefixOf` line || "lint" `isPrefixOf` line
+          then do
+            lift $ atomically $ writeTMChan inChan' line
+            res' <- lift $ atomically $ readTMChan outChan'
+            lift $ putStrLn $ maybe "outChan is closed" (\r -> "result: " <> r) res'
+            when (isNothing res') $ throwE ()
+          else lift $ putStrLn "Unknown command"

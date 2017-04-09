@@ -19,6 +19,9 @@ library:
   - process
   - errors
   - network
+  - stm
+  - stm-chans
+  - transformers
 executables:
   outer:
     main: Main.hs
