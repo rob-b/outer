@@ -30,6 +30,7 @@ library
       src
   exposed-modules:
       Lib
+      Outer
   other-modules:
       Paths_outer
   build-depends:
@@ -40,6 +41,8 @@ library
     , stm
     , stm-chans
     , transformers
+    , resource-pool
+    , retry
 
 executable outer
   default-language: Haskell2010
