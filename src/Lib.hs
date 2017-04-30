@@ -1,11 +1,12 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Lib where
 
+import Debug.Trace
 import           Control.Concurrent            (forkFinally, threadDelay)
 import           Control.Concurrent.STM        (atomically)
 import           Control.Concurrent.STM.TMChan
 import qualified Control.Exception             as X
-import           Control.Monad                 (forever, when)
+import           Control.Monad                 (forever, when, void)
 import           Control.Monad.Trans.State
 import           Control.Monad.Trans.Class     (lift)
 import           Control.Monad.Trans.Except    (runExceptT, throwE)
@@ -16,7 +17,7 @@ import           Network.Socket
 import           System.IO                     (BufferMode (LineBuffering),
                                                 Handle, IOMode (ReadWriteMode),
                                                 hClose, hGetLine, hPutStrLn,
-                                                hSetBinaryMode, hSetBuffering)
+                                                hSetBinaryMode, hSetBuffering, hIsEOF)
 import           System.IO.Error               (isEOFError)
 import           System.Process
 import           System.Process.Internals
@@ -55,38 +56,58 @@ sleep :: Int -> IO ()
 sleep x = threadDelay $ x * 1000
 
 
+data Comm a = Terminated a | Alive a
+
+
 --------------------------------------------------------------------------------
-readUntilOk :: Handle -> [String] -> IO [String]
+readUntilOk :: Handle -> [String] -> IO (Comm [String])
 readUntilOk handle acc = do
   result <- X.try (hGetLine handle) :: IO (Either X.IOException String)
   case result of
     Left err ->
       if isEOFError err
-        then return acc
+        then return (Terminated acc)
         else readUntilOk handle acc
     Right line ->
       if "OK" `isPrefixOf` line
-        then return (line : acc)
+        then return $ Alive (line : acc)
         else readUntilOk handle (line : acc)
 
 
 --------------------------------------------------------------------------------
-go :: TMChan String -> TMChan String -> StateT GhcMod IO ()
-go inChan outChan = forever go'
+ghcmodCommunicate :: TMChan String -> TMChan String -> StateT GhcMod IO ()
+ghcmodCommunicate inChan outChan = go'
   where
+    nextAction :: GhcMod -> StateT GhcMod IO ()
+    nextAction DeadGhcMod = return ()
+    nextAction ActiveGhcMod {} = go'
+
+    go' :: StateT GhcMod IO ()
     go' = do
       msgM <- lift $ atomically $ readTMChan inChan
       case msgM of
-        Nothing -> error "Channel is closed. Do something!"
+        Nothing ->
+          lift $
+          void (putStrLn "Channel is closed; ending communication loop")
         Just msg -> do
           ghcmod <- get
           ghcmod' <- lift $ getGhcProcess ghcmod
-          put ghcmod'
-          lift $
-            hPutStrLn (stdinHandle ghcmod') msg >>
-            readUntilOk (stdoutHandle ghcmod') [] >>=
-            \results ->
-               atomically $ writeTMChan outChan (unlines (reverse results))
+          ghcmod'' <-
+            lift $
+            do hPutStrLn (stdinHandle ghcmod') msg
+               results <- readUntilOk (stdoutHandle ghcmod') []
+               case results of
+                 Terminated results' -> do
+                   atomically $ writeTMChan outChan (unlines (reverse results'))
+                   pidM <- getPid (processHandle ghcmod')
+                   print pidM
+                   return DeadGhcMod
+                 Alive results' -> do
+                   atomically $ writeTMChan outChan (unlines (reverse results'))
+                   return ghcmod'
+          lift $ putStrLn $ "After consumption " <> show ghcmod''
+          put ghcmod''
+          nextAction ghcmod''
 
 
 --------------------------------------------------------------------------------
@@ -121,28 +142,47 @@ getGhcProcess ghcmod@(ActiveGhcMod stdout stdin phandle) = do
 
 
 --------------------------------------------------------------------------------
+-- Once a client connects, `talk` is spawned into a thread. `talk` does two
+-- things:
+-- * spawn a child of its own - ghcmodCommunicate which reads from an
+-- inChannel, writes whatever messages it receives to ghcmod's stdin, reads the
+-- response from ghcmod's stdout and writes that response to an outChannel
+--
+-- * run an infinite `issueCommands` loop which reads input from the client's
+-- handle, checks to see if said input is (roughly) in a format we expect before
+-- sending the input to the inChan for ghcmodCommunicate to process and then
+-- waiting for the response on the outChan before printing it
 talk :: Handle -> StateT GhcMod IO ()
 talk h = do
   ghcmod <- get
   lift $ hSetBuffering h LineBuffering
   inChan <- lift newTMChanIO
   outChan <- lift newTMChanIO
-  lift $ forkFinally
-    (runStateT (go inChan outChan) ghcmod)
-    (\_ -> atomically (closeTMChan inChan) >> atomically (closeTMChan outChan))
-  _ <- lift $ fmap (either id id) $ runExceptT $ forever $ loop inChan outChan
+  _ <- lift $
+    forkFinally
+      (runStateT (ghcmodCommunicate inChan outChan) ghcmod)
+      (handleCommsDeath inChan outChan)
+  _ <- lift $ runExceptT $ forever $ issueCommands inChan outChan
   return ()
   where
-    loop inChan' outChan' =
-      do
-        line <- lift $ hGetLine h
-        if "check" `isPrefixOf` line || "lint" `isPrefixOf` line
-          then do
-            lift $ atomically $ writeTMChan inChan' line
-            res' <- lift $ atomically $ readTMChan outChan'
-            lift $ putStrLn $ maybe "outChan is closed" (\r -> "result: " <> r) res'
-            when (isNothing res') $ throwE ()
-          else lift $ putStrLn "Unknown command"
+    handleCommsDeath inChan' outChan' exc = do
+      putStrLn $ "Comms death because: " <> show exc
+      putStrLn "communicate thread died"
+      atomically (closeTMChan inChan')
+      atomically (closeTMChan outChan')
+      return ()
+    issueCommands inChan' outChan' = do
+      eof <- lift $ hIsEOF h
+      when eof $ lift (handleCommsDeath inChan' outChan' ("Handle closed"::String)) >> throwE ()
+      line <- lift $ hGetLine h
+      if "check" `isPrefixOf` line || "lint" `isPrefixOf` line
+        then do
+          lift $ atomically $ writeTMChan inChan' line
+          res' <- lift $ atomically $ readTMChan outChan'
+          lift $
+            putStrLn $ maybe "outChan is closed" ("GHC-MOD SEZ: " <>) res'
+          when (isNothing res') $ trace "issueCommands loop over" $ throwE ()
+        else lift $ putStrLn "Unknown command"
 
 
 --------------------------------------------------------------------------------
@@ -154,7 +194,7 @@ doTalk sock = do
         handle <- lift $ socketToHandle conn ReadWriteMode
         lift $ forkFinally
           (runStateT (talk handle) ghcmod)
-          (\_ -> hClose handle)
+          (\exc -> print exc >> hClose handle)
 
 
 --------------------------------------------------------------------------------
