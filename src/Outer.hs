@@ -1,19 +1,19 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Outer where
 
-import Control.Monad.Trans.Control (control)
 import           Control.Concurrent            (forkIO)
 import           Control.Concurrent.STM        (atomically)
 import           Control.Concurrent.STM.TMChan
 import qualified Control.Exception             as X
 import           Control.Monad                 (forever, when)
 import           Control.Monad.Trans.Class     (lift)
+import           Control.Monad.Trans.Control   (control)
 import           Control.Monad.Trans.Maybe
 import           Control.Retry                 (RetryPolicyM, constantDelay,
                                                 limitRetries, retrying)
 import qualified Data.ByteString.Char8         as BC8
 import           Data.List                     (isPrefixOf)
-import           Data.Maybe                    (isJust, fromMaybe)
+import           Data.Maybe                    (fromMaybe, isJust)
 import           Data.Monoid                   ((<>))
 import           Data.Pool                     (LocalPool, Pool, createPool,
                                                 destroyResource, putResource,
@@ -36,8 +36,8 @@ import           System.Socket.Type.Stream
 import           System.Timeout                (timeout)
 
 
-talk :: TMChan String -> IO c
-talk inChan =
+talk :: TMChan String -> TMChan String -> IO c
+talk inChan outChan =
   X.bracket
     (socket :: IO (Socket Inet6 Stream TCP))
     (\s -> do
@@ -49,34 +49,35 @@ talk inChan =
        bind s (SocketAddressInet6 inet6Any 8080 0 0)
        listen s 5
        putStrLn "Listening socket ready..."
-       forever $ acceptAndHandle s inChan `X.catch` \e -> print (e :: SocketException))
+       forever $ acceptAndHandle s inChan outChan `X.catch` \e -> print (e :: SocketException))
 
 
 timeMilli :: Num a => a -> a
 timeMilli n = n * 1000
 
 
-acceptAndHandle :: Socket Inet6 Stream TCP -> TMChan String -> IO ()
-acceptAndHandle s inChan =
+acceptAndHandle :: Socket Inet6 Stream TCP -> TMChan String -> TMChan String -> IO ()
+acceptAndHandle s inChan outChan =
   X.bracket
     (accept s)
     (\(p, _addr) -> close p)
     (\(p,_addr) -> do
        msg <- timeout (timeMilli 300000) $ receive p 1024 msgNoSignal
-       cmd <- processCmd msg inChan
+       cmd <- processCmd msg inChan outChan
        let msg' = fromMaybe "either timed out or invalid command" cmd
        sendAll p msg' msgNoSignal
        return ())
 
 
-processCmd :: Maybe BC8.ByteString -> TMChan String -> IO (Maybe BC8.ByteString)
-processCmd msg chan =
+processCmd :: Maybe BC8.ByteString -> TMChan String -> TMChan String -> IO (Maybe BC8.ByteString)
+processCmd msg inChan outChan =
   let isKnown = maybe False ("check" `BC8.isPrefixOf`)
   in (if isKnown msg then
      runMaybeT $
        do msg' <- MaybeT $ return msg
-          lift . atomically $ writeTMChan chan (BC8.unpack msg')
-          return msg'
+          lift . atomically $ writeTMChan inChan (BC8.unpack msg')
+          x <- lift . atomically $ readTMChan outChan
+          MaybeT $ return (BC8.pack <$> x)
      else return Nothing)
 
 
@@ -186,8 +187,7 @@ run :: IO ()
 run = do
   inChan <- newTMChanIO
   outChan <- newTMChanIO
-  forkIO $ talk inChan
-  forkIO . forever $ consume outChan
+  forkIO $ talk inChan outChan
   ghcModCommunicate inChan outChan
 
 
