@@ -25,6 +25,9 @@ library:
   - transformers
   - resource-pool
   - retry
+  - socket
+  - bytestring
+  - monad-control
 executables:
   outer:
     main: Main.hs
