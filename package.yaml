@@ -13,7 +13,6 @@ library:
   source-dirs: src
   ghc-options: -Wall
   exposed-modules:
-  - Lib
   - Outer
   dependencies:
   - base >=4.7 && <5

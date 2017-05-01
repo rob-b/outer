@@ -29,7 +29,6 @@ library
   hs-source-dirs:
       src
   exposed-modules:
-      Lib
       Outer
   other-modules:
       Paths_outer

@@ -36,6 +36,7 @@ import           System.Socket.Type.Stream
 import           System.Timeout                (timeout)
 
 
+--------------------------------------------------------------------------------
 talk :: TMChan String -> TMChan String -> IO c
 talk inChan outChan =
   X.bracket
@@ -49,18 +50,25 @@ talk inChan outChan =
        bind s (SocketAddressInet6 inet6Any 8080 0 0)
        listen s 5
        putStrLn "Listening socket ready..."
-       forever $ acceptAndHandle s inChan outChan `X.catch` \e -> print (e :: SocketException))
+       forever $
+         acceptAndHandle s inChan outChan `X.catch`
+         \e -> print (e :: SocketException))
 
 
+--------------------------------------------------------------------------------
 timeMilli :: Num a => a -> a
 timeMilli n = n * 1000
 
 
-acceptAndHandle :: Socket Inet6 Stream TCP -> TMChan String -> TMChan String -> IO ()
+--------------------------------------------------------------------------------
+acceptAndHandle :: Socket Inet6 Stream TCP
+                -> TMChan String
+                -> TMChan String
+                -> IO ()
 acceptAndHandle s inChan outChan =
   X.bracket
     (accept s)
-    (\(p, _addr) -> close p)
+    (\(p,_addr) -> close p)
     (\(p,_addr) -> do
        msg <- timeout (timeMilli 300000) $ receive p 1024 msgNoSignal
        cmd <- processCmd msg inChan outChan
@@ -69,18 +77,24 @@ acceptAndHandle s inChan outChan =
        return ())
 
 
-processCmd :: Maybe BC8.ByteString -> TMChan String -> TMChan String -> IO (Maybe BC8.ByteString)
+--------------------------------------------------------------------------------
+processCmd
+  :: Maybe BC8.ByteString
+  -> TMChan String
+  -> TMChan String
+  -> IO (Maybe BC8.ByteString)
 processCmd msg inChan outChan =
   let isKnown = maybe False ("check" `BC8.isPrefixOf`)
-  in (if isKnown msg then
-     runMaybeT $
-       do msg' <- MaybeT $ return msg
-          lift . atomically $ writeTMChan inChan (BC8.unpack msg')
-          x <- lift . atomically $ readTMChan outChan
-          MaybeT $ return (BC8.pack <$> x)
-     else return Nothing)
+  in (if isKnown msg
+        then runMaybeT $
+             do msg' <- MaybeT $ return msg
+                lift . atomically $ writeTMChan inChan (BC8.unpack msg')
+                x <- lift . atomically $ readTMChan outChan
+                MaybeT $ return (BC8.pack <$> x)
+        else return Nothing)
 
 
+--------------------------------------------------------------------------------
 killGhcMod :: GhcMod -> IO ()
 killGhcMod (ActiveGhcMod _ _ processHandle') = terminateProcess processHandle'
 
@@ -145,8 +159,8 @@ ghcModCommunicate inChan outChan = do
   forever $ poolio pool (action inChan outChan)
 
   where
-    def :: RetryPolicyM IO
-    def = constantDelay 250000 <> limitRetries 2
+    retryPolicy :: RetryPolicyM IO
+    retryPolicy = constantDelay 250000 <> limitRetries 2
 
     ghcCheck :: Pool GhcMod -> (GhcMod, LocalPool GhcMod) -> IO Bool
     ghcCheck pool (resource,local) = do
@@ -160,9 +174,9 @@ ghcModCommunicate inChan outChan = do
       \runInIO ->
          X.mask $
          \restore -> do
-           (resource,local) <- 
-             retrying def (\_ pair -> ghcCheck pool pair) (\_ -> takeResource pool)
-           ret <- 
+           (resource,local) <-
+             retrying retryPolicy (\_ pair -> ghcCheck pool pair) (\_ -> takeResource pool)
+           ret <-
              restore (runInIO (fn resource)) `X.onException`
              destroyResource pool local resource
            putResource local resource
@@ -170,30 +184,24 @@ ghcModCommunicate inChan outChan = do
 
     action :: TMChan String -> TMChan String -> GhcMod -> IO ()
     action inChan' outChan' ghc = do
-      putStrLn "Doing action..."
       userInputM <- atomically $ readTMChan inChan'
       case userInputM of
-        Nothing -> print "Channel is closed" >> error "Channel is closed"
+        Nothing -> putStrLn "Channel is closed" >> error "Channel is closed"
         Just userInput -> hPutStrLn (stdinHandle ghc) (trim userInput)
       result <- readUntilOk (stdoutHandle ghc) []
       atomically $ writeTMChan outChan' (unlines $ reverse result)
-      where trim = reverse . dropWhile (=='\n') . reverse
+      where
+        trim :: String -> String
+        trim = reverse . dropWhile (== '\n') . reverse
 
     exited :: GhcMod -> IO (Maybe ExitCode)
     exited (ActiveGhcMod _ _ processHandle') = getProcessExitCode processHandle'
 
 
+--------------------------------------------------------------------------------
 run :: IO ()
 run = do
   inChan <- newTMChanIO
   outChan <- newTMChanIO
   forkIO $ talk inChan outChan
   ghcModCommunicate inChan outChan
-
-
-consume :: TMChan String -> IO ()
-consume outChan = do
-  msgM <- atomically $ readTMChan outChan
-  case msgM of
-    Nothing -> error "Cannot consume from closed channel"
-    Just result -> putStrLn result
