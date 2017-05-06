@@ -1,0 +1,10 @@
+- patterns:
+  - ^outer.cabal$
+  - ^stack.yaml$
+  - ^package.yaml$
+  - .*\.hs$
+  commands:
+    - stack build --copy-bins
+    - killall outer || echo outer not running
+    - outer
+
