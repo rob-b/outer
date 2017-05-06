@@ -79,16 +79,19 @@ receive' sock = receive sock 10000 msgNoSignal
 -------------------------------------------------------------------------------
 -- | Load the given files using GHC and report errors/warnings
 check :: Maybe BC8.ByteString -> BC8.ByteString -> IO ()
-check mapFile files = do
-  -- sock <- setupSock 8080
-  -- fileContent <- tny
-  -- _ <- send' sock $ maybe "" (\arg -> "map-file " <> arg <> "\n ") mapFile <> fileContent <> "\EOT\n"
-  -- close sock
+check mapFileM files = do
+  fileContent <- tny
+  let checkCmd = "check " <> files
 
   sock <- setupSock 8080
-  _r <- send' sock $ "check " <> files
-  receive' sock >>= BC8.putStrLn
-  -- close sock
+  case mapFileM of
+    Nothing -> do
+      _ <- send' sock checkCmd
+      receive' sock >>= BC8.putStrLn
+    Just arg -> do
+      _ <- send' sock ("map-file " <> arg <> "\n" <> fileContent <> "\EOT\n")
+      _ <- send' sock checkCmd
+      receive' sock >>= BC8.putStrLn
 
 
 tny :: IO BC8.ByteString

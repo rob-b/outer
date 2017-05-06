@@ -70,7 +70,7 @@ acceptAndHandle s inChan outChan =
     (accept s)
     (\(p,_addr) -> close p)
     (\(p,_addr) -> do
-       msg <- timeout (timeMilli 300000) $ receive p 10000 msgNoSignal
+       msg <- timeout (timeMilli 300000) $ receive p 4096 msgNoSignal
        cmd <- processCmd msg inChan outChan
        let msg' = fromMaybe "either timed out or invalid command" cmd
        sendAll p msg' msgNoSignal
