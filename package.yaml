@@ -14,6 +14,7 @@ library:
   ghc-options: -Wall
   exposed-modules:
   - Outer
+  - Outer.Client
   dependencies:
   - base >=4.7 && <5
   - process
@@ -27,10 +28,21 @@ library:
   - socket
   - bytestring
   - monad-control
+  - optparse-applicative
 executables:
   outer:
     main: Main.hs
     source-dirs: app
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    dependencies:
+    - base
+    - outer
+  couter:
+    main: Main.hs
+    source-dirs: client
     ghc-options:
     - -threaded
     - -rtsopts

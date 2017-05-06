@@ -70,7 +70,7 @@ acceptAndHandle s inChan outChan =
     (accept s)
     (\(p,_addr) -> close p)
     (\(p,_addr) -> do
-       msg <- timeout (timeMilli 300000) $ receive p 1024 msgNoSignal
+       msg <- timeout (timeMilli 300000) $ receive p 10000 msgNoSignal
        cmd <- processCmd msg inChan outChan
        let msg' = fromMaybe "either timed out or invalid command" cmd
        sendAll p msg' msgNoSignal
@@ -84,7 +84,8 @@ processCmd
   -> TMChan String
   -> IO (Maybe BC8.ByteString)
 processCmd msg inChan outChan =
-  let isKnown = maybe False ("check" `BC8.isPrefixOf`)
+  -- let isKnown = maybe False ("check" `BC8.isPrefixOf`)
+  let isKnown = const True
   in (if isKnown msg
         then runMaybeT $
              do msg' <- MaybeT $ return msg
@@ -92,7 +93,6 @@ processCmd msg inChan outChan =
                 x <- lift . atomically $ readTMChan outChan
                 MaybeT $ return (BC8.pack <$> x)
         else return Nothing)
-
 
 --------------------------------------------------------------------------------
 killGhcMod :: GhcMod -> IO ()
@@ -187,7 +187,7 @@ ghcModCommunicate inChan outChan = do
       userInputM <- atomically $ readTMChan inChan'
       case userInputM of
         Nothing -> putStrLn "Channel is closed" >> error "Channel is closed"
-        Just userInput -> hPutStrLn (stdinHandle ghc) (trim userInput)
+        Just userInput -> print userInput >> hPutStrLn (stdinHandle ghc) (trim userInput)
       result <- readUntilOk (stdoutHandle ghc) []
       atomically $ writeTMChan outChan' (unlines $ reverse result)
       where
