@@ -15,6 +15,7 @@ library:
   exposed-modules:
   - Outer
   - Outer.Client
+  - Outer.Comm
   dependencies:
   - base >=4.7 && <5
   - process

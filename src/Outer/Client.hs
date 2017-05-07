@@ -1,13 +1,17 @@
 {-# LANGUAGE OverloadedStrings #-}
-module Outer.Client (main) where
+module Outer.Client where
 
+import Debug.Trace
 import qualified Data.ByteString.Char8 as BC8
+import qualified Data.ByteString.Lazy.Char8 as LBC8
 import Data.Monoid ((<>))
 import Options.Applicative
+import System.IO (hFileSize, hClose, openBinaryFile, Handle, IOMode(ReadMode))
 import System.Socket
 import System.Socket.Family.Inet6
 import System.Socket.Protocol.TCP
 import System.Socket.Type.Stream
+import qualified Control.Exception             as X
 
 
 data Options = Options
@@ -82,16 +86,45 @@ check :: Maybe BC8.ByteString -> BC8.ByteString -> IO ()
 check mapFileM files = do
   fileContent <- tny
   let checkCmd = "check " <> files
-
   sock <- setupSock 8080
   case mapFileM of
     Nothing -> do
       _ <- send' sock checkCmd
       receive' sock >>= BC8.putStrLn
-    Just arg -> do
-      _ <- send' sock ("map-file " <> arg <> "\n" <> fileContent <> "\EOT\n")
-      _ <- send' sock checkCmd
+    Just fileToMap -> do
+      let msgs =
+            BC8.intercalate
+              ""
+              [ xx $ "map-file " <> fileToMap
+              , xx $ "\n" <> fileContent <> "\EOT\n"
+              , xx "\EOT"]
+      _ <- send' sock msgs
       receive' sock >>= BC8.putStrLn
+
+      close sock
+      sock' <- setupSock 8080
+      _ <- send' sock' $ BC8.intercalate "" [xx checkCmd, xx "\EOT"]
+      receive' sock' >>= BC8.putStrLn
+
+
+--------------------------------------------------------------------------------
+xx :: BC8.ByteString -> BC8.ByteString
+xx s = BC8.intercalate "" [BC8.pack . show $ BC8.length s, ":", s]
+
+
+--------------------------------------------------------------------------------
+fileOps :: IO (Integer, IO LBC8.ByteString)
+fileOps =
+  let open =
+        X.try $ openBinaryFile "src/Outer.hs" ReadMode :: IO (Either X.IOException Handle)
+      close' (Left _err) = return ()
+      close' (Right h) = hClose h
+  in X.bracket open close' $ \handle ->
+      case handle of
+        Left exc -> error $ "now what? " <> show exc
+        Right handle' -> do
+          size <- hFileSize handle'
+          return (size, LBC8.hGetContents handle')
 
 
 tny :: IO BC8.ByteString

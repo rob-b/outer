@@ -1,34 +1,21 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Outer where
 
+import Debug.Trace
+import Data.Monoid ((<>))
 import           Control.Concurrent            (forkIO)
 import           Control.Concurrent.STM        (atomically)
 import           Control.Concurrent.STM.TMChan
 import qualified Control.Exception             as X
-import           Control.Monad                 (forever, when)
+import           Control.Monad                 (void, forever)
 import           Control.Monad.Trans.Class     (lift)
-import           Control.Monad.Trans.Control   (control)
 import           Control.Monad.Trans.Maybe
-import           Control.Retry                 (RetryPolicyM, constantDelay,
-                                                limitRetries, retrying)
 import qualified Data.ByteString.Char8         as BC8
 import           Data.List                     (isPrefixOf)
-import           Data.Maybe                    (fromMaybe, isJust)
-import           Data.Monoid                   ((<>))
-import           Data.Pool                     (LocalPool, Pool, createPool,
-                                                destroyResource, putResource,
-                                                takeResource)
-import           System.Exit                   (ExitCode)
-import           System.IO                     (BufferMode (..), Handle,
-                                                hGetLine, hPutStrLn,
-                                                hSetBinaryMode, hSetBuffering)
+import           Data.Maybe                    (fromMaybe)
+import           Outer.Comm                    (GhcMod (..), createPool', poolio)
+import           System.IO                     (Handle, hGetLine, hPutStrLn)
 import           System.IO.Error               (isEOFError)
-import           System.Process                (ProcessHandle,
-                                                StdStream (CreatePipe),
-                                                createProcess,
-                                                getProcessExitCode, proc,
-                                                std_err, std_in, std_out,
-                                                terminateProcess)
 import           System.Socket
 import           System.Socket.Family.Inet6
 import           System.Socket.Protocol.TCP
@@ -65,21 +52,42 @@ acceptAndHandle :: Socket Inet6 Stream TCP
                 -> TMChan String
                 -> TMChan String
                 -> IO ()
-acceptAndHandle s inChan outChan =
-  X.bracket
-    (accept s)
-    (\(p,_addr) -> close p)
-    (\(p,_addr) -> do
-       msg <- timeout (timeMilli 300000) $ receive p 4096 msgNoSignal
-       cmd <- processCmd msg inChan outChan
-       let msg' = fromMaybe "either timed out or invalid command" cmd
-       sendAll p msg' msgNoSignal
-       return ())
+acceptAndHandle s inChan outChan = X.bracket (accept s) (close . fst) acceptAndHandle'
+  where
+    acceptAndHandle' (sock,_addr) = do
+      msg <- timeout (timeMilli 30000) $ consumeMessage sock []
+      case msg of
+        Nothing -> void $ putStrLn "Error consuming input"
+        Just msg' -> do
+          cmd <- processCmd (BC8.intercalate "" msg') inChan outChan
+          let msg'' = fromMaybe "either timed out or invalid command" cmd
+          sendAll sock msg'' msgNoSignal
+          return ()
+
+
+consumeMessage :: Socket f t p -> [BC8.ByteString] -> IO [BC8.ByteString]
+consumeMessage sock acc = do
+  msgSize <- getMsgSize sock ""
+  case msgSize of
+    Nothing -> return $ reverse acc
+    Just size' -> do
+      msg <- receive sock size' msgNoSignal
+      if msg == "\EOT"
+        then return $ reverse acc
+        else consumeMessage sock (msg : acc)
+
+
+getMsgSize :: Socket f t p -> BC8.ByteString -> IO (Maybe Int)
+getMsgSize sock acc = do
+  digit <- receive sock 1 msgNoSignal
+  if digit == ":"
+    then return $ fst <$> BC8.readInt acc
+    else getMsgSize sock (acc <> digit)
 
 
 --------------------------------------------------------------------------------
 processCmd
-  :: Maybe BC8.ByteString
+  :: BC8.ByteString
   -> TMChan String
   -> TMChan String
   -> IO (Maybe BC8.ByteString)
@@ -88,53 +96,12 @@ processCmd msg inChan outChan =
   let isKnown = const True
   in (if isKnown msg
         then runMaybeT $
-             do msg' <- MaybeT $ return msg
+            -- FIXME: `msg` is no longer a maybe so remove the MaybeT
+             do msg' <- MaybeT $ return (Just msg)
                 lift . atomically $ writeTMChan inChan (BC8.unpack msg')
                 x <- lift . atomically $ readTMChan outChan
                 MaybeT $ return (BC8.pack <$> x)
         else return Nothing)
-
---------------------------------------------------------------------------------
-killGhcMod :: GhcMod -> IO ()
-killGhcMod (ActiveGhcMod _ _ processHandle') = terminateProcess processHandle'
-
-
---------------------------------------------------------------------------------
-mkProcess :: IO (Handle, Handle, Handle, ProcessHandle)
-mkProcess = do
-  let p =
-        createProcess
-          (proc "ghc-mod" ["-b", "\n", "legacy-interactive"])
-          { std_in = CreatePipe
-          , std_out = CreatePipe
-          , std_err = CreatePipe
-          }
-  (Just hin,Just hout,Just herr,ph) <- p
-  hSetBuffering hin LineBuffering
-  hSetBuffering herr LineBuffering
-  hSetBuffering hout LineBuffering
-  hSetBinaryMode hout False
-  return (hin, hout, herr, ph)
-
-
---------------------------------------------------------------------------------
-data GhcMod = ActiveGhcMod
-  { stdoutHandle :: Handle
-  , stdinHandle :: Handle
-  , processHandle :: ProcessHandle
-  }
-
-
---------------------------------------------------------------------------------
-mkGhcMod :: IO GhcMod
-mkGhcMod = do
-  (hin,hout,_,ph) <- mkProcess
-  return
-    ActiveGhcMod
-    { stdoutHandle = hout
-    , stdinHandle = hin
-    , processHandle = ph
-    }
 
 
 --------------------------------------------------------------------------------
@@ -145,57 +112,34 @@ readUntilOk handle acc = do
     Left err ->
       if isEOFError err
         then return acc
-        else readUntilOk handle acc
+        else readUntilOk handle (traceShow acc acc)
     Right line ->
       if "OK" `isPrefixOf` line
-        then return $ line : acc
+        then return acc
         else readUntilOk handle (line : acc)
 
 
 --------------------------------------------------------------------------------
-ghcModCommunicate :: TMChan String -> TMChan String -> IO ()
-ghcModCommunicate inChan outChan = do
-  pool <- createPool mkGhcMod killGhcMod 1 10 1
-  forever $ poolio pool (action inChan outChan)
+ghcModCommunicate :: (GhcMod -> IO ()) -> IO b
+ghcModCommunicate action = do
+  pool <- createPool'
+  forever $ poolio pool action
 
+
+--------------------------------------------------------------------------------
+processForGhcComm :: TMChan String -> TMChan String -> GhcMod -> IO ()
+processForGhcComm inChan' outChan' ghc = do
+  userInputM <- atomically $ readTMChan inChan'
+  case userInputM of
+    Nothing -> putStrLn "Channel is closed" >> error "Channel is closed"
+    Just userInput -> do
+      hPutStrLn (stdinHandle ghc) (trim userInput)
+      result <- timeout (timeMilli 500) $ readUntilOk (stdoutHandle ghc) []
+      let output = maybe "No response on stdout" (unlines . reverse) result
+      atomically $ writeTMChan outChan' output
   where
-    retryPolicy :: RetryPolicyM IO
-    retryPolicy = constantDelay 250000 <> limitRetries 2
-
-    ghcCheck :: Pool GhcMod -> (GhcMod, LocalPool GhcMod) -> IO Bool
-    ghcCheck pool (resource,local) = do
-      exited' <- isJust <$> exited resource
-      when exited' $ destroyResource pool local resource
-      return exited'
-
-    poolio :: Pool GhcMod -> (GhcMod -> IO ()) -> IO ()
-    poolio pool fn =
-      control $
-      \runInIO ->
-         X.mask $
-         \restore -> do
-           (resource,local) <-
-             retrying retryPolicy (\_ pair -> ghcCheck pool pair) (\_ -> takeResource pool)
-           ret <-
-             restore (runInIO (fn resource)) `X.onException`
-             destroyResource pool local resource
-           putResource local resource
-           return ret
-
-    action :: TMChan String -> TMChan String -> GhcMod -> IO ()
-    action inChan' outChan' ghc = do
-      userInputM <- atomically $ readTMChan inChan'
-      case userInputM of
-        Nothing -> putStrLn "Channel is closed" >> error "Channel is closed"
-        Just userInput -> print userInput >> hPutStrLn (stdinHandle ghc) (trim userInput)
-      result <- readUntilOk (stdoutHandle ghc) []
-      atomically $ writeTMChan outChan' (unlines $ reverse result)
-      where
-        trim :: String -> String
-        trim = reverse . dropWhile (== '\n') . reverse
-
-    exited :: GhcMod -> IO (Maybe ExitCode)
-    exited (ActiveGhcMod _ _ processHandle') = getProcessExitCode processHandle'
+    trim :: String -> String
+    trim = reverse . dropWhile (== '\n') . reverse
 
 
 --------------------------------------------------------------------------------
@@ -204,4 +148,4 @@ run = do
   inChan <- newTMChanIO
   outChan <- newTMChanIO
   forkIO $ talk inChan outChan
-  ghcModCommunicate inChan outChan
+  ghcModCommunicate (processForGhcComm inChan outChan)
