@@ -1,19 +1,20 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Outer where
 
-import Debug.Trace
-import Data.Monoid ((<>))
 import           Control.Concurrent            (forkIO)
 import           Control.Concurrent.STM        (atomically)
 import           Control.Concurrent.STM.TMChan
 import qualified Control.Exception             as X
-import           Control.Monad                 (void, forever)
+import           Control.Monad                 (forever, void)
 import           Control.Monad.Trans.Class     (lift)
 import           Control.Monad.Trans.Maybe
 import qualified Data.ByteString.Char8         as BC8
 import           Data.List                     (isPrefixOf)
 import           Data.Maybe                    (fromMaybe)
-import           Outer.Comm                    (GhcMod (..), createPool', poolio)
+import           Data.Monoid                   ((<>))
+import           Debug.Trace
+import           Outer.Comm                    (GhcMod (..), createPool',
+                                                poolio)
 import           System.IO                     (Handle, hGetLine, hPutStrLn)
 import           System.IO.Error               (isEOFError)
 import           System.Socket
@@ -24,7 +25,7 @@ import           System.Timeout                (timeout)
 
 
 --------------------------------------------------------------------------------
-talk :: TMChan String -> TMChan String -> IO c
+talk :: TMChan String -> TMChan String -> IO ()
 talk inChan outChan =
   X.bracket
     (socket :: IO (Socket Inet6 Stream TCP))
@@ -112,10 +113,10 @@ readUntilOk handle acc = do
     Left err ->
       if isEOFError err
         then return acc
-        else readUntilOk handle (traceShow acc acc)
+        else readUntilOk handle acc
     Right line ->
       if "OK" `isPrefixOf` line
-        then return acc
+        then return (traceShow (line :acc) (line : acc))
         else readUntilOk handle (line : acc)
 
 
@@ -147,5 +148,6 @@ run :: IO ()
 run = do
   inChan <- newTMChanIO
   outChan <- newTMChanIO
-  forkIO $ talk inChan outChan
-  ghcModCommunicate (processForGhcComm inChan outChan)
+  forkIO $ ghcModCommunicate (processForGhcComm inChan outChan)
+  talk inChan outChan
+  return ()

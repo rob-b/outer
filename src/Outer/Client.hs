@@ -1,17 +1,18 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Outer.Client where
 
-import Debug.Trace
-import qualified Data.ByteString.Char8 as BC8
+import qualified Control.Exception          as X
+import           Control.Monad              (unless)
+import qualified Data.ByteString.Char8      as BC8
 import qualified Data.ByteString.Lazy.Char8 as LBC8
-import Data.Monoid ((<>))
-import Options.Applicative
-import System.IO (hFileSize, hClose, openBinaryFile, Handle, IOMode(ReadMode))
-import System.Socket
-import System.Socket.Family.Inet6
-import System.Socket.Protocol.TCP
-import System.Socket.Type.Stream
-import qualified Control.Exception             as X
+import           Data.Monoid                ((<>))
+import           Options.Applicative
+import           System.IO                  (Handle, IOMode (ReadMode), hClose,
+                                             hFileSize, openBinaryFile)
+import           System.Socket
+import           System.Socket.Family.Inet6
+import           System.Socket.Protocol.TCP
+import           System.Socket.Type.Stream
 
 
 data Options = Options
@@ -77,7 +78,7 @@ send' sock msg = send sock msg msgNoSignal
 
 -------------------------------------------------------------------------------
 receive' :: Socket f t p -> IO BC8.ByteString
-receive' sock = receive sock 10000 msgNoSignal
+receive' sock = receive sock 4096 msgNoSignal
 
 
 -------------------------------------------------------------------------------
@@ -99,12 +100,13 @@ check mapFileM files = do
               , xx $ "\n" <> fileContent <> "\EOT\n"
               , xx "\EOT"]
       _ <- send' sock msgs
-      receive' sock >>= BC8.putStrLn
-
+      response <- receive' sock
+      unless (response == "OK\n") $ BC8.putStrLn response
       close sock
       sock' <- setupSock 8080
       _ <- send' sock' $ BC8.intercalate "" [xx checkCmd, xx "\EOT"]
-      receive' sock' >>= BC8.putStrLn
+      response' <- receive' sock'
+      BC8.putStrLn response'
 
 
 --------------------------------------------------------------------------------
