@@ -6,13 +6,10 @@ import           Control.Concurrent.STM        (atomically)
 import           Control.Concurrent.STM.TMChan
 import qualified Control.Exception             as X
 import           Control.Monad                 (forever, void)
-import           Control.Monad.Trans.Class     (lift)
-import           Control.Monad.Trans.Maybe
 import qualified Data.ByteString.Char8         as BC8
 import           Data.List                     (isPrefixOf)
 import           Data.Maybe                    (fromMaybe)
 import           Data.Monoid                   ((<>))
-import           Debug.Trace
 import           Outer.Comm                    (GhcMod (..), createPool',
                                                 poolio)
 import           System.IO                     (Handle, hGetLine, hPutStrLn)
@@ -53,19 +50,21 @@ acceptAndHandle :: Socket Inet6 Stream TCP
                 -> TMChan String
                 -> TMChan String
                 -> IO ()
-acceptAndHandle s inChan outChan = X.bracket (accept s) (close . fst) acceptAndHandle'
+acceptAndHandle s inChan outChan =
+  X.bracket (accept s) (close . fst) acceptAndHandle'
   where
-    acceptAndHandle' (sock,_addr) = do
-      msg <- timeout (timeMilli 30000) $ consumeMessage sock []
+    acceptAndHandle' (sock, _addr) = do
+      msg <- timeout (timeMilli 3000) $ consumeMessage sock []
       case msg of
         Nothing -> void $ putStrLn "Error consuming input"
         Just msg' -> do
           cmd <- processCmd (BC8.intercalate "" msg') inChan outChan
           let msg'' = fromMaybe "either timed out or invalid command" cmd
-          sendAll sock msg'' msgNoSignal
+          _ <- sendAll sock msg'' msgNoSignal
           return ()
 
 
+--------------------------------------------------------------------------------
 consumeMessage :: Socket f t p -> [BC8.ByteString] -> IO [BC8.ByteString]
 consumeMessage sock acc = do
   msgSize <- getMsgSize sock ""
@@ -78,6 +77,7 @@ consumeMessage sock acc = do
         else consumeMessage sock (msg : acc)
 
 
+--------------------------------------------------------------------------------
 getMsgSize :: Socket f t p -> BC8.ByteString -> IO (Maybe Int)
 getMsgSize sock acc = do
   digit <- receive sock 1 msgNoSignal
@@ -92,17 +92,10 @@ processCmd
   -> TMChan String
   -> TMChan String
   -> IO (Maybe BC8.ByteString)
-processCmd msg inChan outChan =
-  -- let isKnown = maybe False ("check" `BC8.isPrefixOf`)
-  let isKnown = const True
-  in (if isKnown msg
-        then runMaybeT $
-            -- FIXME: `msg` is no longer a maybe so remove the MaybeT
-             do msg' <- MaybeT $ return (Just msg)
-                lift . atomically $ writeTMChan inChan (BC8.unpack msg')
-                x <- lift . atomically $ readTMChan outChan
-                MaybeT $ return (BC8.pack <$> x)
-        else return Nothing)
+processCmd msg inChan outChan = do
+  atomically $ writeTMChan inChan (BC8.unpack msg)
+  x <- atomically $ readTMChan outChan
+  pure (BC8.pack <$> x)
 
 
 --------------------------------------------------------------------------------
@@ -116,7 +109,7 @@ readUntilOk handle acc = do
         else readUntilOk handle acc
     Right line ->
       if "OK" `isPrefixOf` line
-        then return (traceShow (line :acc) (line : acc))
+        then pure (line : acc)
         else readUntilOk handle (line : acc)
 
 
@@ -135,7 +128,7 @@ processForGhcComm inChan' outChan' ghc = do
     Nothing -> putStrLn "Channel is closed" >> error "Channel is closed"
     Just userInput -> do
       hPutStrLn (stdinHandle ghc) (trim userInput)
-      result <- timeout (timeMilli 500) $ readUntilOk (stdoutHandle ghc) []
+      result <- timeout (timeMilli 10000) $ readUntilOk (stdoutHandle ghc) []
       let output = maybe "No response on stdout" (unlines . reverse) result
       atomically $ writeTMChan outChan' output
   where
@@ -148,6 +141,6 @@ run :: IO ()
 run = do
   inChan <- newTMChanIO
   outChan <- newTMChanIO
-  forkIO $ ghcModCommunicate (processForGhcComm inChan outChan)
+  _ <- forkIO $ ghcModCommunicate (processForGhcComm inChan outChan)
   talk inChan outChan
   return ()

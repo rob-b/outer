@@ -78,40 +78,56 @@ send' sock msg = send sock msg msgNoSignal
 
 -------------------------------------------------------------------------------
 receive' :: Socket f t p -> IO BC8.ByteString
-receive' sock = receive sock 4096 msgNoSignal
+receive' sock = rr ""
+  where
+    rr acc = do
+      res <- receive sock 4096 msgNoSignal
+      if BC8.null res
+        then pure acc
+        else rr (acc <> res)
 
 
 -------------------------------------------------------------------------------
 -- | Load the given files using GHC and report errors/warnings
 check :: Maybe BC8.ByteString -> BC8.ByteString -> IO ()
 check mapFileM files = do
-  fileContent <- tny
   let checkCmd = "check " <> files
+  fileContent <- BC8.readFile (BC8.unpack files)
   sock <- setupSock 8080
   case mapFileM of
     Nothing -> do
-      _ <- send' sock checkCmd
-      receive' sock >>= BC8.putStrLn
+      _ <-
+        send' sock $
+        BC8.intercalate
+          ""
+          [toNetString (checkCmd <> "\n") <> toNetString "\EOT"]
+      response <- receive' sock
+      BC8.putStrLn response
+      close sock
     Just fileToMap -> do
       let msgs =
             BC8.intercalate
               ""
-              [ xx $ "map-file " <> fileToMap
-              , xx $ "\n" <> fileContent <> "\EOT\n"
-              , xx "\EOT"]
+              [ toNetString $ "map-file " <> fileToMap
+              , toNetString $ "\n" <> fileContent <> "\EOT\n"
+              , toNetString "\EOT"
+              ]
       _ <- send' sock msgs
       response <- receive' sock
       unless (response == "OK\n") $ BC8.putStrLn response
       close sock
       sock' <- setupSock 8080
-      _ <- send' sock' $ BC8.intercalate "" [xx checkCmd, xx "\EOT"]
+      _ <-
+        send' sock' $
+        BC8.intercalate "" [toNetString checkCmd <> "\n" <> toNetString "\EOT"]
       response' <- receive' sock'
-      BC8.putStrLn response'
+      close sock'
+      unless (response' == "OK\n") $ BC8.putStrLn response'
 
 
 --------------------------------------------------------------------------------
-xx :: BC8.ByteString -> BC8.ByteString
-xx s = BC8.intercalate "" [BC8.pack . show $ BC8.length s, ":", s]
+toNetString :: BC8.ByteString -> BC8.ByteString
+toNetString s = BC8.intercalate "" [BC8.pack . show $ BC8.length s, ":", s]
 
 
 --------------------------------------------------------------------------------
@@ -127,10 +143,6 @@ fileOps =
         Right handle' -> do
           size <- hFileSize handle'
           return (size, LBC8.hGetContents handle')
-
-
-tny :: IO BC8.ByteString
-tny = BC8.readFile "src/Outer.hs"
 
 
 -------------------------------------------------------------------------------
